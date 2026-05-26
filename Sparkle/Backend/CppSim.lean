@@ -243,7 +243,7 @@ partial def emitExpr (typeMap : List (String × HWType)) (e : Expr) : String :=
         let mask := (2 ^ sliceWidth - 1 : Nat)
         let maskStr := s!"0x{Nat.toDigits 16 mask |> String.ofList}ULL"
         if bitOffset == 0 then
-          s!"(((uint64_t){srcExpr}[{wordIdx + 1}] << 32) | (uint64_t){srcExpr}[{wordIdx}]) & {maskStr})"
+          s!"((((uint64_t){srcExpr}[{wordIdx + 1}] << 32) | (uint64_t){srcExpr}[{wordIdx}]) & {maskStr})"
         else
           s!"((((uint64_t){srcExpr}[{wordIdx + 1}] << {32 - bitOffset}) | ((uint64_t){srcExpr}[{wordIdx}] >> {bitOffset})) & {maskStr})"
       else
@@ -353,7 +353,8 @@ partial def emitExpr (typeMap : List (String × HWType)) (e : Expr) : String :=
 /-- Parts of a C++ class generated from a single statement -/
 structure StmtParts where
   declarations    : List String
-  evalBody        : List String
+  evalBodyReads   : List String   -- register-to-wire reads (emitted first in eval)
+  evalBody        : List String   -- combinational logic
   tickBody        : List String
   resetBody       : List String
   evalTickLocals  : List String   -- _next local decls for evalTick()
@@ -361,13 +362,14 @@ structure StmtParts where
 instance : Append StmtParts where
   append a b :=
     { declarations := a.declarations ++ b.declarations
+    , evalBodyReads := a.evalBodyReads ++ b.evalBodyReads
     , evalBody := a.evalBody ++ b.evalBody
     , tickBody := a.tickBody ++ b.tickBody
     , resetBody := a.resetBody ++ b.resetBody
     , evalTickLocals := a.evalTickLocals ++ b.evalTickLocals }
 
 def StmtParts.empty : StmtParts :=
-  { declarations := [], evalBody := [], tickBody := [], resetBody := [], evalTickLocals := [] }
+  { declarations := [], evalBodyReads := [], evalBody := [], tickBody := [], resetBody := [], evalTickLocals := [] }
 
 /-- Emit a C++ constant expression for an init value with given width -/
 def emitInitValue (initValue : Int) (width : Nat) : String :=
@@ -430,13 +432,24 @@ def emitStmt (stmt : Stmt) (typeMap : List (String × HWType))
       | .op .mul _ =>
         let sn := sanitizeName lhs
         let expr := emitExpr typeMap rhs
-        { declarations := []
+        { declarations := [], evalBodyReads := []
         , evalBody := [s!"        {sn} = {expr};"]
         , tickBody := []
         , resetBody := []
         , evalTickLocals := [] }
+      | .ref srcName =>
+        -- Wide reference assign: register-to-wire feedback (e.g., _tmp_loop_0 = _tmp_loop_body_N)
+        let sn := sanitizeName lhs
+        let srcSn := sanitizeName srcName
+        let nWords := (width + 31) / 32
+        { declarations := [], evalBodyReads :=
+            [s!"        memcpy({sn}.data(), {srcSn}.data(), {nWords} * sizeof(uint32_t));"]
+        , evalBody := []
+        , tickBody := []
+        , resetBody := []
+        , evalTickLocals := [] }
       | _ =>
-        -- Skip wide assigns (handled via memory/array paths elsewhere)
+        -- Skip other wide assigns (handled via memory/array paths elsewhere)
         StmtParts.empty
     else
       -- For deep MUX chains (≥16 arms), emit if-else for branch prediction
@@ -445,7 +458,7 @@ def emitStmt (stmt : Stmt) (typeMap : List (String × HWType))
           emitMuxAsIfElse typeMap sn width rhs 16
         else []
       if !ifElseLines.isEmpty then
-        { declarations := []
+        { declarations := [], evalBodyReads := []
         , evalBody := ifElseLines
         , tickBody := []
         , resetBody := []
@@ -453,7 +466,7 @@ def emitStmt (stmt : Stmt) (typeMap : List (String × HWType))
       else
         let expr := emitExpr typeMap rhs
         let masked := if exprIsMasked width rhs then expr else applyMask expr width
-        { declarations := []
+        { declarations := [], evalBodyReads := []
         , evalBody := [s!"        {sanitizeName lhs} = {masked};"]
         , tickBody := []
         , resetBody := []
@@ -485,6 +498,7 @@ def emitStmt (stmt : Stmt) (typeMap : List (String × HWType))
       if ifElseLines.isEmpty then [s!"        {nextName} = {inputExpr};"]
       else ifElseLines
     { declarations := [s!"    {cppType} {outName};", s!"    {cppType} {nextName};"]
+    , evalBodyReads := []
     , evalBody := body
     , tickBody := [s!"        {outName} = {nextName};"]
     , resetBody := [s!"        {outName} = {initExpr};"]
@@ -507,6 +521,7 @@ def emitStmt (stmt : Stmt) (typeMap : List (String × HWType))
       else [s!"        if ({emitExpr typeMap writeEnable}) {memName}[{emitExpr typeMap writeAddr}] = {emitExpr typeMap writeData};"]
     if comboRead then
       { declarations := [memDecl] ++ rdDecl
+      , evalBodyReads := []
       , evalBody := [s!"        {rdName} = {memName}[{emitExpr typeMap readAddr}];"]
       , tickBody := writeTickLine
       , resetBody := [s!"        {memName}.fill(0);"]
@@ -515,6 +530,7 @@ def emitStmt (stmt : Stmt) (typeMap : List (String × HWType))
       let addrLatch := s!"{memName}_raddr"
       let addrType := emitCppType (.bitVector addrWidth)
       { declarations := [memDecl, s!"    {addrType} {addrLatch};"] ++ rdDecl
+      , evalBodyReads := []
       , evalBody := [s!"        {addrLatch} = {emitExpr typeMap readAddr};"]
       , tickBody :=
           writeTickLine ++
@@ -543,6 +559,7 @@ def emitStmt (stmt : Stmt) (typeMap : List (String × HWType))
         | _ => none
       else none
     { declarations := [s!"    {className} {iName};"]
+    , evalBodyReads := []
     , evalBody := inputConns ++ [s!"        {iName}.eval();"] ++ outputConns
     , tickBody := [s!"        {iName}.tick();"]
     , resetBody := [s!"        {iName}.reset();"]
@@ -675,8 +692,32 @@ def emitModule (m : Module) (design : Option Design := none)
         | none => result := result ++ [decl]
       result
 
-    -- Eval/tick/reset bodies
-    let evalBody := allParts.foldl (fun acc p => acc ++ p.evalBody) []
+    -- Eval/tick/reset bodies.
+    -- Reorder: register reads (wire = register_output) come FIRST in eval.
+    -- This is needed because Signal.loop creates feedback wires that must
+    -- read the register BEFORE combinational logic uses them.
+    let rawEvalBody := allParts.foldl (fun acc p => acc ++ p.evalBodyReads ++ p.evalBody) []
+    -- Collect register output names for identification
+    let registerNames := m.body.filterMap fun s =>
+      match s with
+      | .register output _ _ _ _ => some (sanitizeName output)
+      | _ => none
+    -- Partition: statements that are simple register reads go first
+    let (regReads, comboLogic) := rawEvalBody.partition fun line =>
+      registerNames.any fun rn => (line.splitOn s!" = {rn};").length > 1
+    -- For wide loop feedback wires: add explicit memcpy from register to wire.
+    -- The Signal.loop compilation creates _tmp_loop_N (wire) and _tmp_loop_body_M (register)
+    -- but for wide types (>64 bits), the assignment is not generated.
+    let loopWireInits := internalWires.filterMap fun (w : Port) =>
+      let sn := sanitizeName w.name
+      if w.ty.bitWidth > 64 && sn.startsWith "_tmp_loop_" && (sn.splitOn "_body_").length == 1 then
+        -- Find the corresponding register (loop body)
+        let regName := registerNames.find? fun rn => rn.startsWith "_tmp_loop_body_"
+        match regName with
+        | some rn => some s!"        memcpy({sn}.data(), {rn}.data(), sizeof({sn}));"
+        | none => none
+      else none
+    let evalBody := loopWireInits ++ regReads ++ comboLogic
     let tickBody := allParts.foldl (fun acc p => acc ++ p.tickBody) []
     let resetBody := allParts.foldl (fun acc p => acc ++ p.resetBody) []
     let evalTickLocals := allParts.foldl (fun acc p => acc ++ p.evalTickLocals) []
@@ -814,19 +855,35 @@ def emitModule (m : Module) (design : Option Design := none)
     -- evalTick: inline all eval code + tick, with ALL non-tick wires as locals.
     -- This avoids member access overhead and improves cache locality.
     -- Wires that are NOT referenced in tick() can be local to evalTick.
+    -- Map wires to their register sources (for evalTick initialization).
+    -- A wire that reads from a register should be initialized from that register.
+    let wireToRegSrc := m.body.filterMap fun s =>
+      match s with
+      | .assign lhs (.ref regName) =>
+        if registerNames.contains (sanitizeName regName) then
+          some (sanitizeName lhs, sanitizeName regName)
+        else none
+      | _ => none
     let evalTickWireLocals := internalWires.filterMap fun (w : Port) =>
       let sn := sanitizeName w.name
-      -- Localize all wires that are not tick-referenced or memory.
-      -- Scalar wires (≤ 64 bit): zero-initialized for safety.
-      -- Wide integers (> 64 bit): declared without initialization to
-      -- avoid per-cycle std::array zero-init overhead. They are always
-      -- written before read in the eval body (same as Verilog wire semantics).
       if !tickRefs.contains sn && !memoryNames.contains sn then
-        if w.ty.bitWidth ≤ 64 then
-          some s!"        {emitCppType w.ty} {sn} = 0;"
-        else
-          let nWords := (w.ty.bitWidth + 31) / 32
-          some ("        std::array<uint32_t, " ++ toString nWords ++ "> " ++ sn ++ ";")
+        -- Check if this wire reads from a register
+        match wireToRegSrc.find? (fun (wn, _) => wn == sn) with
+        | some (_, regSrc) =>
+          -- Initialize from register value
+          if w.ty.bitWidth > 64 then
+            let nWords := (w.ty.bitWidth + 31) / 32
+            some ("        std::array<uint32_t, " ++ toString nWords ++ "> " ++ sn ++ ";\n        memcpy(" ++ sn ++ ".data(), " ++ regSrc ++ ".data(), sizeof(" ++ sn ++ "));")
+          else
+            some s!"        {emitCppType w.ty} {sn} = {regSrc};"
+        | none =>
+          -- Normal init for combinational wires
+          if w.ty.bitWidth ≤ 64 then
+            some s!"        {emitCppType w.ty} {sn} = 0;"
+          else
+            -- Wide arrays: zero-initialize for safety (fixes loop feedback wires)
+            let nWords := (w.ty.bitWidth + 31) / 32
+            some ("        std::array<uint32_t, " ++ toString nWords ++ "> " ++ sn ++ ";\n        " ++ sn ++ ".fill(0);")
       else none
     let allWireLocalDecls := evalTickWireLocals
     let guardedEvalBody := evalBody
