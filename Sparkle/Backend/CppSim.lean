@@ -445,51 +445,34 @@ def emitStmt (stmt : Stmt) (typeMap : List (String × HWType))
         let nWords := (width + 31) / 32
         let line := s!"        memcpy({sn}.data(), {srcSn}.data(), {nWords} * sizeof(uint32_t));"
         -- Only put in evalBodyReads if source is a register (class member).
-        -- If source is a computed wire, it must go in evalBody (after the wire is computed).
         let srcIsRegister := registerOutputNames.any fun rn => sanitizeName rn == srcSn
         if srcIsRegister then
           { declarations := [], evalBodyReads := [line]
-          , evalBody := []
-          , tickBody := []
-          , resetBody := []
-          , evalTickLocals := [] }
+          , evalBody := [], tickBody := [], resetBody := [], evalTickLocals := [] }
         else
           { declarations := [], evalBodyReads := []
-          , evalBody := [line]
-          , tickBody := []
-          , resetBody := []
-          , evalTickLocals := [] }
+          , evalBody := [line], tickBody := [], resetBody := [], evalTickLocals := [] }
       | .slice srcExpr hi lo =>
-        -- Wide slice assign: tuple projection (e.g., _tmp_s_1 = _tmp_loop_0[hi:lo])
-        -- For wide-to-wide slices, use memcpy with word offset
+        -- Wide slice assign: tuple projection with memcpy + word offset
         let sn := sanitizeName lhs
         let srcStr := emitExpr typeMap srcExpr
-        let startBit := lo
-        let wordOffset := startBit / 32
-        let bitOffset := startBit % 32
+        let wordOffset := lo / 32
+        let bitOffset := lo % 32
         let nWords := (width + 31) / 32
         if bitOffset == 0 then
-          -- Word-aligned slice: simple memcpy with offset
           { declarations := [], evalBodyReads := []
           , evalBody := [s!"        memcpy({sn}.data(), {srcStr}.data() + {wordOffset}, {nWords} * sizeof(uint32_t));"]
-          , tickBody := []
-          , resetBody := []
-          , evalTickLocals := [] }
+          , tickBody := [], resetBody := [], evalTickLocals := [] }
         else
-          -- Non-word-aligned: need bit shifting
           let shiftLines := List.range nWords |>.map fun i =>
             let srcWordLo := wordOffset + i
             let srcWordHi := srcWordLo + 1
             s!"        {sn}[{i}] = ({srcStr}[{srcWordLo}] >> {bitOffset}) | ({srcStr}[{srcWordHi}] << {32 - bitOffset});"
           { declarations := [], evalBodyReads := []
           , evalBody := shiftLines
-          , tickBody := []
-          , resetBody := []
-          , evalTickLocals := [] }
+          , tickBody := [], resetBody := [], evalTickLocals := [] }
       | .concat args =>
-        -- Wide concat assign: pack constituent expressions into the target array.
-        -- Concat semantics: args are [MSB, ..., LSB] (first arg is highest bits).
-        -- We process in reverse (LSB first) to build up from bit 0.
+        -- Wide concat assign: pack constituent expressions into target array
         let sn := sanitizeName lhs
         let revArgs := args.reverse  -- LSB first
         let (lines, _) := revArgs.foldl (fun (acc : List String × Nat) arg =>
@@ -497,7 +480,6 @@ def emitStmt (stmt : Stmt) (typeMap : List (String × HWType))
           let argWidth := inferExprWidth typeMap arg
           let argWidth := if argWidth == 0 then 32 else argWidth
           if argWidth <= 64 then
-            -- Scalar value: write into the appropriate word(s)
             let wordIdx := bitPos / 32
             let bitOffset := bitPos % 32
             let argExpr := emitExpr typeMap arg
@@ -507,22 +489,18 @@ def emitStmt (stmt : Stmt) (typeMap : List (String × HWType))
               else if bitOffset + argWidth <= 32 then
                 [s!"        {sn}[{wordIdx}] |= ((uint32_t)({argExpr}) << {bitOffset});"]
               else
-                -- Spans two words
                 [s!"        {sn}[{wordIdx}] |= ((uint32_t)({argExpr}) << {bitOffset});",
                  s!"        {sn}[{wordIdx + 1}] = ((uint32_t)({argExpr}) >> {32 - bitOffset});"]
             else
-              -- 33-64 bit scalar: write into two words
               if bitOffset == 0 then
                 [s!"        {sn}[{wordIdx}] = (uint32_t)({argExpr});",
                  s!"        {sn}[{wordIdx + 1}] = (uint32_t)(({argExpr}) >> 32);"]
               else
-                -- Non-aligned 64-bit write: split into multiple statements
                 let lb := "{"
                 let rb := "}"
                 [s!"        {lb} uint64_t _cv = (uint64_t)({argExpr}); {sn}[{wordIdx}] |= (uint32_t)(_cv << {bitOffset}); {sn}[{wordIdx + 1}] = (uint32_t)(_cv >> {32 - bitOffset}); {rb}"]
             (lines ++ newLines, bitPos + argWidth)
           else
-            -- Wide sub-expression: use memcpy if word-aligned
             let wordIdx := bitPos / 32
             let bitOffset := bitPos % 32
             let srcExpr := emitExpr typeMap arg
@@ -530,21 +508,16 @@ def emitStmt (stmt : Stmt) (typeMap : List (String × HWType))
             let newLines := if bitOffset == 0 then
               [s!"        memcpy({sn}.data() + {wordIdx}, {srcExpr}.data(), {nWords} * sizeof(uint32_t));"]
             else
-              -- Non-aligned wide sub-expression: rare, emit per-word shifts
               List.range nWords |>.map fun i =>
                 s!"        {sn}[{wordIdx + i}] |= ({srcExpr}[{i}] << {bitOffset}); if ({wordIdx + i + 1} < {(width + 31) / 32}) {sn}[{wordIdx + i + 1}] |= ({srcExpr}[{i}] >> {32 - bitOffset});"
             (lines ++ newLines, bitPos + argWidth)
         ) ([], 0)
-        -- Zero-init first (since we use |= for non-aligned fields)
         let nWords := (width + 31) / 32
         let initLine := s!"        {sn}.fill(0);"
         { declarations := [], evalBodyReads := []
         , evalBody := [initLine] ++ lines
-        , tickBody := []
-        , resetBody := []
-        , evalTickLocals := [] }
+        , tickBody := [], resetBody := [], evalTickLocals := [] }
       | .op .mux muxArgs =>
-        -- Wide mux: condition ? thenVal : elseVal
         let sn := sanitizeName lhs
         let nWords := (width + 31) / 32
         match muxArgs with
@@ -554,23 +527,16 @@ def emitStmt (stmt : Stmt) (typeMap : List (String × HWType))
           let elseStr := emitExpr typeMap elseVal
           { declarations := [], evalBodyReads := []
           , evalBody := [s!"        if ({condStr}) memcpy({sn}.data(), {thenStr}.data(), {nWords} * sizeof(uint32_t)); else memcpy({sn}.data(), {elseStr}.data(), {nWords} * sizeof(uint32_t));"]
-          , tickBody := []
-          , resetBody := []
-          , evalTickLocals := [] }
+          , tickBody := [], resetBody := [], evalTickLocals := [] }
         | _ =>
           { declarations := [], evalBodyReads := []
           , evalBody := [s!"        // Wide mux assign: {sn} (unexpected args count {List.length muxArgs}, skipped)"]
-          , tickBody := []
-          , resetBody := []
-          , evalTickLocals := [] }
+          , tickBody := [], resetBody := [], evalTickLocals := [] }
       | _ =>
-        -- Generic wide assign: emit as comment (shape not recognized)
         let sn := sanitizeName lhs
         { declarations := [], evalBodyReads := []
         , evalBody := [s!"        // Wide assign: {sn} (shape not recognized, skipped)"]
-        , tickBody := []
-        , resetBody := []
-        , evalTickLocals := [] }
+        , tickBody := [], resetBody := [], evalTickLocals := [] }
     else
       -- For deep MUX chains (≥16 arms), emit if-else for branch prediction
       let sn := sanitizeName lhs
@@ -826,19 +792,13 @@ def emitModule (m : Module) (design : Option Design := none)
       registerNames.any fun rn => (line.splitOn s!" = {rn};").length > 1
     -- Reorder combo logic: wide concat assigns (packing registers into loop body)
     -- must come before slice/ref assigns that project from the packed wire.
-    -- This handles the Signal.loop feedback pattern where _tmp_b_* and _tmp_loop_body_*
-    -- are concat wires that must be computed before _tmp_loop_0 (which copies from
-    -- _tmp_loop_body_*) and slice projections from _tmp_loop_0.
     let hasSubstr (s sub : String) : Bool := (s.splitOn sub).length > 1
     let (concatAssigns, otherCombo) := comboLogic.partition fun line =>
-      -- Detect wide concat fill+pack lines (they start with _tmp_b_ or _tmp_loop_body_)
       let trimmed := line.trimLeft
       (trimmed.startsWith "_tmp_b_" && (hasSubstr trimmed ".fill(0)" || hasSubstr trimmed "|=" || hasSubstr trimmed "memcpy(_tmp_b_" || hasSubstr trimmed "[")) ||
       (trimmed.startsWith "_tmp_loop_body_" && (hasSubstr trimmed ".fill(0)" || hasSubstr trimmed "|=" || hasSubstr trimmed "memcpy(_tmp_loop_body_" || hasSubstr trimmed "[")) ||
-      -- Also catch memcpy that assigns TO _tmp_b_ or _tmp_loop_body_
       (trimmed.startsWith "memcpy(_tmp_b_") ||
       (trimmed.startsWith "memcpy(_tmp_loop_body_") ||
-      -- Also catch memcpy from _tmp_loop_body_ to _tmp_loop_ (loop wire feedback)
       (trimmed.startsWith "memcpy(_tmp_loop_" && hasSubstr trimmed "_tmp_loop_body_")
     let evalBody := regReads ++ concatAssigns ++ otherCombo
     let tickBody := allParts.foldl (fun acc p => acc ++ p.tickBody) []
