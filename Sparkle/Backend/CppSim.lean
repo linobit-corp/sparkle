@@ -448,9 +448,42 @@ def emitStmt (stmt : Stmt) (typeMap : List (String × HWType))
         , tickBody := []
         , resetBody := []
         , evalTickLocals := [] }
+      | .slice srcExpr hi lo =>
+        -- Wide slice assign: tuple projection (e.g., _tmp_s_1 = _tmp_loop_0[hi:lo])
+        -- For wide-to-wide slices, use memcpy with word offset
+        let sn := sanitizeName lhs
+        let srcStr := emitExpr typeMap srcExpr
+        let startBit := lo
+        let wordOffset := startBit / 32
+        let bitOffset := startBit % 32
+        let nWords := (width + 31) / 32
+        if bitOffset == 0 then
+          -- Word-aligned slice: simple memcpy with offset
+          { declarations := [], evalBodyReads := []
+          , evalBody := [s!"        memcpy({sn}.data(), {srcStr}.data() + {wordOffset}, {nWords} * sizeof(uint32_t));"]
+          , tickBody := []
+          , resetBody := []
+          , evalTickLocals := [] }
+        else
+          -- Non-word-aligned: need bit shifting
+          -- For simplicity, emit a per-word shift-and-OR loop
+          let shiftLines := List.range nWords |>.map fun i =>
+            let srcWordLo := wordOffset + i
+            let srcWordHi := srcWordLo + 1
+            s!"        {sn}[{i}] = ({srcStr}[{srcWordLo}] >> {bitOffset}) | ({srcStr}[{srcWordHi}] << {32 - bitOffset});"
+          { declarations := [], evalBodyReads := []
+          , evalBody := shiftLines
+          , tickBody := []
+          , resetBody := []
+          , evalTickLocals := [] }
       | _ =>
-        -- Skip other wide assigns (handled via memory/array paths elsewhere)
-        StmtParts.empty
+        -- Generic wide assign: emit as comment (shape not recognized)
+        let sn := sanitizeName lhs
+        { declarations := [], evalBodyReads := []
+        , evalBody := [s!"        // Wide assign: {sn} (shape not recognized, skipped)"]
+        , tickBody := []
+        , resetBody := []
+        , evalTickLocals := [] }
     else
       -- For deep MUX chains (≥16 arms), emit if-else for branch prediction
       let sn := sanitizeName lhs
@@ -696,7 +729,10 @@ def emitModule (m : Module) (design : Option Design := none)
     -- Reorder: register reads (wire = register_output) come FIRST in eval.
     -- This is needed because Signal.loop creates feedback wires that must
     -- read the register BEFORE combinational logic uses them.
-    let rawEvalBody := allParts.foldl (fun acc p => acc ++ p.evalBodyReads ++ p.evalBody) []
+    -- Collect ALL register reads first, then ALL combinational logic
+    let allEvalReads := allParts.foldl (fun acc p => acc ++ p.evalBodyReads) []
+    let allEvalCombo := allParts.foldl (fun acc p => acc ++ p.evalBody) []
+    let rawEvalBody := allEvalReads ++ allEvalCombo
     -- Collect register output names for identification
     let registerNames := m.body.filterMap fun s =>
       match s with
